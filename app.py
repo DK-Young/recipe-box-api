@@ -8,6 +8,7 @@ That is the point: you will add both, lesson by lesson, in Units 2 and 3.
 import sqlite3
 
 from flask import Flask, g, jsonify, request
+from werkzeug.security import generate_password_hash, check_password_hash
 
 DATABASE = "recipes.db"
 
@@ -85,6 +86,71 @@ def create_recipe():
     ).fetchone()
     return jsonify(recipe_to_dict(row)), 201
 
+@app.post("/login")
+def login():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username")
+    password = data.get("password")
+
+    # Missing fields: still generic — don't distinguish "no password sent"
+    # from "wrong password" in the response.
+    if not username or not password:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    db = get_db()
+    row = db.execute(
+        "SELECT id, username, password_hash FROM users WHERE username = ?",
+        (username,),
+    ).fetchone()
+
+    # Same 401 for "user not found" and "wrong password" — no enumeration hint.
+    if row is None or not check_password_hash(row["password_hash"], password):
+        return jsonify({"error": "invalid credentials"}), 401
+
+    # Safe identity only: never the hash, never the raw password.
+    return jsonify({"id": row["id"], "username": row["username"]}), 200
+
+@app.post("/register")
+def register():
+    data = request.get_json(silent=True) or {}
+
+    username = data.get("username")
+    email = data.get("email")
+    password = data.get("password")
+
+    # Basic validation: all fields required
+    if not username or not email or not password:
+        return jsonify({"error": "username, email, and password are required"}), 400
+
+    # 1) hash the password – never store or return the raw password
+    password_hash = generate_password_hash(password)
+
+    db = get_db()
+    try:
+        # 2) insert the user with the hash, using parameterized SQL
+        cur = db.execute(
+            """
+            INSERT INTO users (username, email, password_hash)
+            VALUES (?, ?, ?)
+            """,
+            (username, email, password_hash),
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        # username or email already in use
+        return jsonify({"error": "username or email already registered"}), 409
+
+    # 3) return a safe response (no password fields)
+    return (
+        jsonify(
+            {
+                "id": cur.lastrowid,
+                "username": username,
+                "email": email,
+            }
+        ),
+        201,
+    )
 
 @app.patch("/recipes/<int:recipe_id>")
 def update_recipe(recipe_id):
