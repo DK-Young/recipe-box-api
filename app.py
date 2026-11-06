@@ -92,10 +92,9 @@ def login():
     username = data.get("username")
     password = data.get("password")
 
-    # Missing fields: still generic — don't distinguish "no password sent"
-    # from "wrong password" in the response.
+    # Input validation: missing or empty fields → 400 Bad Request
     if not username or not password:
-        return jsonify({"error": "invalid credentials"}), 401
+        return jsonify({"error": "username and password are required"}), 400
 
     db = get_db()
     row = db.execute(
