@@ -8,6 +8,7 @@ That is the point: you will add both, lesson by lesson, in Units 2 and 3.
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 
 import jwt
 from dotenv import load_dotenv
@@ -49,6 +50,30 @@ def recipe_to_dict(row):
         "is_public": bool(row["is_public"]),
     }
 
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        parts = auth_header.split()
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            return jsonify({"error": "missing or invalid authorization header"}), 401
+        token = parts[1]
+
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "token expired, please log in again"}), 401
+        except jwt.PyJWTError:
+            return jsonify({"error": "invalid token"}), 401
+
+        user_id = payload.get("sub")
+        if not user_id:
+            return jsonify({"error": "invalid token payload"}), 401
+
+        g.user_id = user_id
+        g.user_role = payload.get("role")
+        return f(*args, **kwargs)
+    return wrapper
 
 @app.get("/")
 def hello():
@@ -93,27 +118,8 @@ def get_recipe(recipe_id):
 
 
 @app.post("/recipes")
+@require_auth
 def create_recipe():
-    # 1–2: require a well-formed Authorization: Bearer <token> header.
-    auth_header = request.headers.get("Authorization", "")
-    parts = auth_header.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return jsonify({"error": "missing or invalid authorization header"}), 401
-    token = parts[1]
-
-    # 3: verify signature + expiry. Expired gets its own clear message.
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    except jwt.ExpiredSignatureError:
-        return jsonify({"error": "token expired, please log in again"}), 401
-    except jwt.PyJWTError:
-        return jsonify({"error": "invalid token"}), 401
-
-    user_id = payload.get("sub")
-    if not user_id:
-        return jsonify({"error": "invalid token payload"}), 401
-    g.user_id = user_id
-
     data = request.get_json(silent=True)
     if not data or not data.get("title") or not data.get("ingredients"):
         return jsonify({"error": "title and ingredients are required"}), 400
@@ -127,7 +133,7 @@ def create_recipe():
                 data["ingredients"],
                 data.get("instructions", ""),
                 1 if data.get("is_public", True) else 0,
-                int(g.user_id),  # from the verified token — never the client body
+                int(g.user_id),
             ),
         )
         db.commit()
@@ -144,26 +150,24 @@ def login():
     username = data.get("username")
     password = data.get("password")
 
-    # Input validation: missing or empty fields → 400 Bad Request
     if not username or not password:
         return jsonify({"error": "username and password are required"}), 400
 
     db = get_db()
     row = db.execute(
-        "SELECT id, username, password_hash FROM users WHERE username = ?",
+        "SELECT id, username, password_hash, role FROM users WHERE username = ?",
         (username,),
     ).fetchone()
 
-    # Same 401 for "user not found" and "wrong password" — no enumeration hint.
     if row is None or not check_password_hash(row["password_hash"], password):
         return jsonify({"error": "invalid credentials"}), 401
 
-    # Identity confirmed. Issue a signed, short-lived JWT.
     now = datetime.now(timezone.utc)
     token = jwt.encode(
         {
             "sub": str(row["id"]),
             "username": row["username"],
+            "role": row["role"],
             "iat": now,
             "exp": now + timedelta(minutes=15),
         },
@@ -189,17 +193,13 @@ def register():
 
     db = get_db()
     try:
-        # 2) insert the user with the hash, using parameterized SQL
         cur = db.execute(
-            """
-            INSERT INTO users (username, email, password_hash)
-            VALUES (?, ?, ?)
-            """,
-            (username, email, password_hash),
+            "INSERT INTO users (username, email, password_hash, role)"
+            " VALUES (?, ?, ?, ?)",
+            (username, email, password_hash, "user"),
         )
         db.commit()
     except sqlite3.IntegrityError:
-        # username or email already in use
         return jsonify({"error": "username or email already registered"}), 409
 
     # 3) return a safe response (no password fields)
@@ -215,39 +215,17 @@ def register():
     )
 
 @app.patch("/recipes/<int:recipe_id>")
+@require_auth
 def update_recipe(recipe_id):
-    auth_header = request.headers.get("Authorization", "")
-    parts = auth_header.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return jsonify({"error": "missing or invalid authorization header"}), 401
-    token = parts[1]
-
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    except jwt.ExpiredSignatureError:
-        return jsonify({"error": "token expired, please log in again"}), 401
-    except jwt.PyJWTError:
-        return jsonify({"error": "invalid token"}), 401
-
-    user_id = payload.get("sub")
-    if not user_id:
-        return jsonify({"error": "invalid token payload"}), 401
-    g.user_id = user_id
-
     db = get_db()
-
-    # 1) Load the recipe
     row = db.execute(
         "SELECT id, owner_id FROM recipes WHERE id = ?", (recipe_id,)
     ).fetchone()
     if row is None:
         return jsonify({"error": "recipe not found"}), 404
-
-    # 2) Ownership check
-    if row["owner_id"] != int(g.user_id):
+    if row["owner_id"] != int(g.user_id) and g.user_role != "admin":
         return jsonify({"error": "forbidden: you do not own this recipe"}), 403
 
-    # 3) Now it's safe to update
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "a JSON body is required"}), 400
@@ -272,37 +250,17 @@ def update_recipe(recipe_id):
 
 
 @app.delete("/recipes/<int:recipe_id>")
+@require_auth
 def delete_recipe(recipe_id):
-    auth_header = request.headers.get("Authorization", "")
-    parts = auth_header.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return jsonify({"error": "missing or invalid authorization header"}), 401
-    token = parts[1]
-
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    except jwt.PyJWTError:
-        return jsonify({"error": "invalid or expired token"}), 401
-
-    user_id = payload.get("sub")
-    if not user_id:
-        return jsonify({"error": "invalid token payload"}), 401
-    g.user_id = user_id
-
     db = get_db()
-
-    # 1) Load the recipe
     row = db.execute(
         "SELECT id, owner_id FROM recipes WHERE id = ?", (recipe_id,)
     ).fetchone()
     if row is None:
         return jsonify({"error": "recipe not found"}), 404
-
-    # 2) Ownership check
-    if row["owner_id"] != int(g.user_id):
+    if row["owner_id"] != int(g.user_id) and g.user_role != "admin":
         return jsonify({"error": "forbidden: you do not own this recipe"}), 403
 
-    # 3) Now it's safe to delete
     db.execute("DELETE FROM recipes WHERE id = ?", (recipe_id,))
     db.commit()
     return "", 204
