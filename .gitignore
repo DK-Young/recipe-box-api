@@ -11,3 +11,7 @@ __pycache__/
 
 # Secrets - never commit these
 .env
+
+# local scratch credentials
+*_tok.txt
+token.json
