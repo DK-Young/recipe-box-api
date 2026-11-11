@@ -5,12 +5,22 @@ and it trusts everyone. There is no authentication and no authorization yet.
 That is the point: you will add both, lesson by lesson, in Units 2 and 3.
 """
 
+import os
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
+import jwt
+from dotenv import load_dotenv
 from flask import Flask, g, jsonify, request
 from werkzeug.security import generate_password_hash, check_password_hash
 
+load_dotenv()
+
 DATABASE = "recipes.db"
+
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET is not set — check your .env file")
 
 app = Flask(__name__)
 
@@ -63,6 +73,24 @@ def get_recipe(recipe_id):
 
 @app.post("/recipes")
 def create_recipe():
+    # 1–2: require a well-formed Authorization: Bearer <token> header.
+    auth_header = request.headers.get("Authorization", "")
+    parts = auth_header.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return jsonify({"error": "missing or invalid authorization header"}), 401
+    token = parts[1]
+
+    # 3: verify the token's signature and expiry, then trust its claims.
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        return jsonify({"error": "invalid or expired token"}), 401
+
+    user_id = payload.get("sub")
+    if not user_id:
+        return jsonify({"error": "invalid token payload"}), 401
+    g.user_id = user_id
+
     data = request.get_json(silent=True)
     if not data or not data.get("title") or not data.get("ingredients"):
         return jsonify({"error": "title and ingredients are required"}), 400
@@ -106,8 +134,19 @@ def login():
     if row is None or not check_password_hash(row["password_hash"], password):
         return jsonify({"error": "invalid credentials"}), 401
 
-    # Safe identity only: never the hash, never the raw password.
-    return jsonify({"id": row["id"], "username": row["username"]}), 200
+    # Identity confirmed. Issue a signed, short-lived JWT.
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "sub": str(row["id"]),
+            "username": row["username"],
+            "iat": now,
+            "exp": now + timedelta(minutes=15),
+        },
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+    return jsonify({"token": token, "token_type": "Bearer"}), 200
 
 @app.post("/register")
 def register():
@@ -153,6 +192,22 @@ def register():
 
 @app.patch("/recipes/<int:recipe_id>")
 def update_recipe(recipe_id):
+    auth_header = request.headers.get("Authorization", "")
+    parts = auth_header.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return jsonify({"error": "missing or invalid authorization header"}), 401
+    token = parts[1]
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        return jsonify({"error": "invalid or expired token"}), 401
+
+    user_id = payload.get("sub")
+    if not user_id:
+        return jsonify({"error": "invalid token payload"}), 401
+    g.user_id = user_id
+
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "a JSON body is required"}), 400
@@ -185,13 +240,28 @@ def update_recipe(recipe_id):
 
 @app.delete("/recipes/<int:recipe_id>")
 def delete_recipe(recipe_id):
+    auth_header = request.headers.get("Authorization", "")
+    parts = auth_header.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return jsonify({"error": "missing or invalid authorization header"}), 401
+    token = parts[1]
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        return jsonify({"error": "invalid or expired token"}), 401
+
+    user_id = payload.get("sub")
+    if not user_id:
+        return jsonify({"error": "invalid token payload"}), 401
+    g.user_id = user_id
+
     db = get_db()
     cur = db.execute("DELETE FROM recipes WHERE id = ?", (recipe_id,))
     db.commit()
     if cur.rowcount == 0:
         return jsonify({"error": "recipe not found"}), 404
     return "", 204
-
 
 if __name__ == "__main__":
     app.run(debug=True)
