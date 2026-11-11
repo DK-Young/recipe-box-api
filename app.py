@@ -80,11 +80,13 @@ def create_recipe():
         return jsonify({"error": "missing or invalid authorization header"}), 401
     token = parts[1]
 
-    # 3: verify the token's signature and expiry, then trust its claims.
+    # 3: verify signature + expiry. Expired gets its own clear message.
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "token expired, please log in again"}), 401
     except jwt.PyJWTError:
-        return jsonify({"error": "invalid or expired token"}), 401
+        return jsonify({"error": "invalid token"}), 401
 
     user_id = payload.get("sub")
     if not user_id:
@@ -141,7 +143,7 @@ def login():
             "sub": str(row["id"]),
             "username": row["username"],
             "iat": now,
-            "exp": now + timedelta(minutes=15),
+            "exp": now + timedelta(seconds=30),
         },
         JWT_SECRET,
         algorithm="HS256",
@@ -264,4 +266,4 @@ def delete_recipe(recipe_id):
     return "", 204
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False)
